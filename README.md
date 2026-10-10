@@ -9,7 +9,7 @@ independent Model Context Protocol (MCP) services for live information.
 ```text
 React browser (3000) -> FastAPI chat API (8000) -> OpenAI Chat Completions
           |                   |                  -> Gemini OpenAI-compatible API
-   provider/model picker      |
+ provider/model picker + SSE  |
                      streamable HTTP MCP
                          |             |
                   Search MCP (8001)  Live-data MCP (8002)
@@ -44,14 +44,23 @@ key but can apply limits; production apps should use licensed providers and cach
 {
   "provider": "gemini",
   "model": "gemini-3.8-flash",
+  "stream": true,
   "messages": [{"role": "user", "content": "Weather in Austin?"}]
 }
 ```
 
+Set `stream` to `true` to receive `text/event-stream` events. The gateway emits
+`delta` events for incremental text, `tool_call` events after MCP tools complete,
+`done` when the response finishes, and `error` if a failure occurs after streaming
+has started. Omit `stream` or set it to `false` for the original JSON response.
+For Gemini thinking models, the gateway also preserves required
+[thought signatures](https://ai.google.dev/gemini-api/docs/thought-signatures)
+between streamed function-call rounds without exposing them to the browser.
+
 `GET /v1/models` returns the server-controlled provider/model catalog and whether each
 provider is configured. The chat endpoint validates the requested pair, lists tools
 from each MCP service, presents them as function tools, executes selected calls, sends
-the outputs back to the chosen vendor, then returns its answer.
+the outputs back to the chosen vendor, then returns or streams its answer.
 
 Model choices can be changed without code by editing the comma-separated
 `OPENAI_MODELS` and `GEMINI_MODELS` environment variables. The allow lists prevent a

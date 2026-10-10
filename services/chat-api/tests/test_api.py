@@ -94,3 +94,111 @@ def test_selected_provider_and_model_are_used(monkeypatch):
     assert response.json()["answer"] == "Hello from Gemini"
     assert seen["model"] == "gemini-3.8-flash"
     assert seen["messages"][-1] == {"role": "user", "content": "hello"}
+
+
+def test_streaming_completion_emits_sse_deltas(monkeypatch):
+    seen: dict = {}
+
+    async def chunks():
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Hello ", tool_calls=None))])
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="stream", tool_calls=None))])
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            seen.update(kwargs)
+            return chunks()
+
+    @asynccontextmanager
+    async def fake_connected_tools():
+        yield SimpleNamespace(tools=[])
+
+    monkeypatch.setattr(settings, "gemini_api_key", "test-key")
+    monkeypatch.setattr(main, "provider_client", lambda provider: SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions()),
+    ))
+    monkeypatch.setattr(main, "connected_tools", fake_connected_tools)
+
+    response = TestClient(app).post("/v1/chat/completions", json={
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert 'event: delta\ndata: {"content": "Hello "}' in response.text
+    assert 'event: delta\ndata: {"content": "stream"}' in response.text
+    assert "event: done" in response.text
+    assert seen["stream"] is True
+
+
+def test_streaming_completion_runs_mcp_tool_round(monkeypatch):
+    requests: list[dict] = []
+    tool_requests: list[tuple[str, dict]] = []
+
+    async def tool_chunks():
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                index=0,
+                id="call_weather",
+                function=SimpleNamespace(name="weather_lookup", arguments='{"location":"Chi'),
+                extra_content={"google": {"thought_signature": "opaque-signature"}},
+            )],
+        ))])
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                index=0,
+                id=None,
+                function=SimpleNamespace(name=None, arguments='cago"}'),
+                extra_content=None,
+            )],
+        ))])
+
+    async def answer_chunks():
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+            content="It is sunny.",
+            tool_calls=None,
+        ))])
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            requests.append(kwargs)
+            return tool_chunks() if len(requests) == 1 else answer_chunks()
+
+    class FakeTools:
+        tools = [{"type": "function", "function": {"name": "weather_lookup"}}]
+
+        async def call(self, name, arguments):
+            tool_requests.append((name, arguments))
+            return {"temperature": 72}
+
+    @asynccontextmanager
+    async def fake_connected_tools():
+        yield FakeTools()
+
+    monkeypatch.setattr(settings, "gemini_api_key", "test-key")
+    monkeypatch.setattr(main, "provider_client", lambda provider: SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions()),
+    ))
+    monkeypatch.setattr(main, "connected_tools", fake_connected_tools)
+
+    response = TestClient(app).post("/v1/chat/completions", json={
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "stream": True,
+        "messages": [{"role": "user", "content": "weather?"}],
+    })
+
+    assert response.status_code == 200
+    assert "event: tool_call" in response.text
+    assert '"name": "weather_lookup"' in response.text
+    assert 'event: delta\ndata: {"content": "It is sunny."}' in response.text
+    assert "opaque-signature" not in response.text
+    assert tool_requests == [("weather_lookup", {"location": "Chicago"})]
+    assert requests[1]["messages"][-1]["role"] == "tool"
+    assert requests[1]["messages"][-2]["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": "opaque-signature"},
+    }
