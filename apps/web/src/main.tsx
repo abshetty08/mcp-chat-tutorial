@@ -1,73 +1,12 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { ChatApiClient } from "./chat-api";
+import type { Message, ProviderId, ProviderOption, ToolCall } from "./types";
 import "./styles.css";
-
-type ProviderId = "openai" | "gemini";
-type Message = {
-  role: "user" | "assistant";
-  content: string;
-  provider?: ProviderId;
-  model?: string;
-  streaming?: boolean;
-};
-type ToolCall = { name: string; arguments: Record<string, unknown>; result: unknown };
-type ModelOption = { id: string; name: string };
-type ProviderOption = {
-  id: ProviderId;
-  name: string;
-  configured: boolean;
-  models: ModelOption[];
-};
-type ModelsResponse = { providers: ProviderOption[]; default_provider: ProviderId };
-type StreamPayload = {
-  content?: string;
-  detail?: string;
-  provider?: ProviderId;
-  model?: string;
-  name?: string;
-  arguments?: Record<string, unknown>;
-  result?: unknown;
-};
 
 const starters = ["Weather in Chicago", "AAPL stock price", "NBA scores today", "What happened in AI today?"];
 const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
-
-async function consumeEventStream(
-  response: Response,
-  onEvent: (event: string, payload: StreamPayload) => void,
-) {
-  if (!response.body) throw new Error("This browser did not provide a streaming response body.");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  function dispatch(block: string) {
-    let event = "message";
-    const data: string[] = [];
-    for (const line of block.split("\n")) {
-      if (line.startsWith("event:")) event = line.slice(6).trim();
-      if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
-    }
-    if (data.length) onEvent(event, JSON.parse(data.join("\n")) as StreamPayload);
-  }
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        dispatch(buffer.slice(0, boundary));
-        buffer = buffer.slice(boundary + 2);
-        boundary = buffer.indexOf("\n\n");
-      }
-      if (done) break;
-    }
-    if (buffer.trim()) dispatch(buffer);
-  } finally {
-    reader.releaseLock();
-  }
-}
+const chatApi = new ChatApiClient(apiUrl);
 
 function App() {
   const [messages, setMessages] = useState<Message[]>([
@@ -90,9 +29,7 @@ function App() {
   useEffect(() => {
     async function loadModels() {
       try {
-        const response = await fetch(`${apiUrl}/v1/models`);
-        const data: ModelsResponse = await response.json();
-        if (!response.ok) throw new Error("Unable to load the model catalog.");
+        const data = await chatApi.getModels();
         setProviders(data.providers);
         const preferred = data.providers.find(provider => provider.id === data.default_provider && provider.configured)
           ?? data.providers.find(provider => provider.configured)
@@ -135,45 +72,38 @@ function App() {
     setToolCalls([]);
     setLoading(true);
     try {
-      const response = await fetch(`${apiUrl}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      await chatApi.streamCompletion(
+        {
           messages: nextMessages.map(({ role, content }) => ({ role, content })),
           provider: providerId,
           model: modelId,
-          stream: true,
-        }),
-      });
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.detail ?? "The chat API returned an error.");
-      }
-      await consumeEventStream(response, (streamEvent, data) => {
-        if (streamEvent === "error") throw new Error(data.detail ?? "The streamed response failed.");
-        if (streamEvent === "delta" && data.content) {
-          setMessages(current => current.map((message, index) => index === assistantIndex
-            ? { ...message, content: message.content + data.content }
-            : message));
-        }
-        if (streamEvent === "tool_call" && data.name && data.arguments) {
-          setToolCalls(current => [...current, {
-            name: data.name!,
-            arguments: data.arguments!,
-            result: data.result,
-          }]);
-        }
-        if (streamEvent === "done") {
-          setMessages(current => current.map((message, index) => index === assistantIndex
-            ? {
-                ...message,
-                provider: data.provider ?? message.provider,
-                model: data.model ?? message.model,
-                streaming: false,
-              }
-            : message));
-        }
-      });
+        },
+        (streamEvent, data) => {
+          if (streamEvent === "error") throw new Error(data.detail ?? "The streamed response failed.");
+          if (streamEvent === "delta" && data.content) {
+            setMessages(current => current.map((message, index) => index === assistantIndex
+              ? { ...message, content: message.content + data.content }
+              : message));
+          }
+          if (streamEvent === "tool_call" && data.name && data.arguments) {
+            setToolCalls(current => [...current, {
+              name: data.name!,
+              arguments: data.arguments!,
+              result: data.result,
+            }]);
+          }
+          if (streamEvent === "done") {
+            setMessages(current => current.map((message, index) => index === assistantIndex
+              ? {
+                  ...message,
+                  provider: data.provider ?? message.provider,
+                  model: data.model ?? message.model,
+                  streaming: false,
+                }
+              : message));
+          }
+        },
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to reach the chat API.");
       setMessages(current => {

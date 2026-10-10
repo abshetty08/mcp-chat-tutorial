@@ -19,6 +19,28 @@ React browser (3000) -> FastAPI chat API (8000) -> OpenAI Chat Completions
 The folders in `services/` are standalone Python microservices, each with its own
 Dockerfile and requirements. `apps/web` is an independent React/Vite frontend.
 
+## Code organization
+
+The tutorial uses small objects with explicit responsibilities and keeps framework
+entry points as composition roots:
+
+- `services/chat-api/app/providers.py` owns vendor configuration, model allowlists,
+  and SDK client creation.
+- `services/chat-api/app/mcp_gateway.py` manages MCP connections, discovery, and
+  tool invocation.
+- `services/chat-api/app/chat_service.py` orchestrates completion and tool-call
+  loops without depending on FastAPI routes.
+- `services/chat-api/app/streaming.py` encapsulates SSE encoding and incremental
+  tool-call reconstruction.
+- Each MCP server delegates transport wrappers to domain service classes in
+  `search_service.py` or `live_data_services.py`.
+- The React component delegates HTTP and SSE state machines to `ChatApiClient` and
+  `ServerSentEventStream`; rendering remains functional and hook-based.
+
+Constructor injection keeps provider clients and tool gateways replaceable in tests,
+while Pydantic models remain the single API contract shared by the route and service
+layers.
+
 ## Run locally
 
 1. Create an OpenAI API Platform key at <https://platform.openai.com/api-keys>, a
