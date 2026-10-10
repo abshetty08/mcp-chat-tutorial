@@ -1,14 +1,15 @@
 # MCP Chat Tutorial
 
-A runnable tutorial for a ChatGPT-like web application. A React client calls a Python
-chat API. The chat API calls an OpenAI model and two independent Model Context Protocol
-(MCP) services for live information.
+A runnable tutorial for a multi-provider chat application. A React client calls a
+Python chat API, where the user-selected OpenAI or Google Gemini model can call two
+independent Model Context Protocol (MCP) services for live information.
 
 ## Architecture
 
 ```text
-React browser (3000) -> FastAPI chat API (8000) -> OpenAI Responses API
-                              |                 
+React browser (3000) -> FastAPI chat API (8000) -> OpenAI Chat Completions
+          |                   |                  -> Gemini OpenAI-compatible API
+   provider/model picker      |
                      streamable HTTP MCP
                          |             |
                   Search MCP (8001)  Live-data MCP (8002)
@@ -20,10 +21,11 @@ Dockerfile and requirements. `apps/web` is an independent React/Vite frontend.
 
 ## Run locally
 
-1. Create an API Platform key at <https://platform.openai.com/api-keys>. A ChatGPT
-   subscription is not an API credential; this app requires an API key from the same
-   OpenAI account and never sends it to the browser.
-2. Run `cp .env.example .env`, then set `OPENAI_API_KEY` in `.env`.
+1. Create an OpenAI API Platform key at <https://platform.openai.com/api-keys>, a
+   Gemini key at <https://aistudio.google.com/app/apikey>, or both. Chat product
+   subscriptions are not API credentials. Keys remain in the server container.
+2. Run `cp .env.example .env`, then set `OPENAI_API_KEY`, `GEMINI_API_KEY`, or both
+   in `.env`. A provider without a key appears disabled in the client.
 3. Run `docker compose up --build`.
 4. Open <http://localhost:3000>. The API’s interactive documentation is at
    <http://localhost:8000/docs>.
@@ -39,11 +41,21 @@ key but can apply limits; production apps should use licensed providers and cach
 `POST /v1/chat/completions`
 
 ```json
-{"messages": [{"role": "user", "content": "Weather in Austin?"}]}
+{
+  "provider": "gemini",
+  "model": "gemini-3.8-flash",
+  "messages": [{"role": "user", "content": "Weather in Austin?"}]
+}
 ```
 
-The endpoint lists tools from each MCP service, presents them as OpenAI function tools,
-executes selected calls, sends the outputs back to the model, then returns its answer.
+`GET /v1/models` returns the server-controlled provider/model catalog and whether each
+provider is configured. The chat endpoint validates the requested pair, lists tools
+from each MCP service, presents them as function tools, executes selected calls, sends
+the outputs back to the chosen vendor, then returns its answer.
+
+Model choices can be changed without code by editing the comma-separated
+`OPENAI_MODELS` and `GEMINI_MODELS` environment variables. The allow lists prevent a
+browser from requesting arbitrary or unexpectedly expensive models.
 
 ## Build individual services
 
@@ -57,8 +69,11 @@ docker run --rm -p 3000:80 tutorial-web
 
 ## Security checklist
 
-- Keep `OPENAI_API_KEY` in `.env` or a secret manager, never in React code or Git.
+- Keep `OPENAI_API_KEY` and `GEMINI_API_KEY` in `.env` or a secret manager, never in
+  React code, `.env.example`, or Git.
 - Add authentication, rate limits, audit logs, and request limits before production.
 - Search snippets are untrusted reference data, never instructions for the model.
 
-The chat service follows the [official OpenAI quickstart](https://developers.openai.com/api/docs/quickstart): the Python SDK reads an API key from the server environment and uses the Responses API for tool calling.
+The gateway uses the OpenAI Python client for both vendors. OpenAI supports function
+tools through [Chat Completions](https://developers.openai.com/api/reference/python/resources/chat/subresources/completions/methods/create),
+and Google documents the same client shape through its [OpenAI compatibility endpoint](https://ai.google.dev/gemini-api/docs/openai).
