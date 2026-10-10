@@ -5,26 +5,53 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from fastmcp.client.client import CallToolResult
 
-import app.main as main
+from app.chat_service import ChatCompletionService
+from app.config import Settings
+from app.main import create_app
+from app.providers import ProviderRegistry
+from app.serialization import JsonValueSerializer
 
-app = main.app
-settings = main.settings
+
+@asynccontextmanager
+async def empty_tools():
+    yield SimpleNamespace(tools=[])
+
+
+def build_client(
+    *,
+    settings: Settings | None = None,
+    provider_client=None,
+    tool_gateway_factory=empty_tools,
+) -> tuple[TestClient, ProviderRegistry]:
+    settings = settings or Settings(
+        _env_file=None,
+        openai_api_key="test-openai-key",
+        gemini_api_key="test-gemini-key",
+    )
+    providers = ProviderRegistry(settings)
+    if provider_client is not None:
+        providers.client_for = lambda _provider: provider_client
+    chat_service = ChatCompletionService(providers, tool_gateway_factory)
+    container = SimpleNamespace(providers=providers, chat_service=chat_service)
+    return TestClient(create_app(container)), providers
 
 
 def test_health_endpoint():
-    assert TestClient(app).get("/health").json() == {"status": "ok"}
+    client, _ = build_client()
+    assert client.get("/health").json() == {"status": "ok"}
 
 
 def test_empty_message_is_rejected():
-    response = TestClient(app).post("/v1/chat/completions", json={"messages": [{"role": "user", "content": ""}]})
+    client, _ = build_client()
+    response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": ""}]})
     assert response.status_code == 422
 
 
 def test_model_catalog_contains_both_providers_without_secrets():
-    response = TestClient(app).get("/v1/models")
+    client, _ = build_client()
+    response = client.get("/v1/models")
     assert response.status_code == 200
-    payload = response.json()
-    assert [provider["id"] for provider in payload["providers"]] == ["openai", "gemini"]
+    assert [provider["id"] for provider in response.json()["providers"]] == ["openai", "gemini"]
     assert "api_key" not in response.text.lower()
 
 
@@ -35,16 +62,14 @@ def test_fastmcp_tool_result_is_reduced_to_json_safe_data():
         meta=None,
         data={"temperature": 72},
     )
-
-    serialized = main.dump_value(result)
-
+    serialized = JsonValueSerializer().encode(result)
     assert serialized == {"temperature": 72}
     assert json.loads(json.dumps(serialized)) == {"temperature": 72}
 
 
-def test_unknown_model_is_rejected_before_calling_a_vendor(monkeypatch):
-    monkeypatch.setattr(settings, "openai_api_key", "test-key")
-    response = TestClient(app).post("/v1/chat/completions", json={
+def test_unknown_model_is_rejected_before_calling_a_vendor():
+    client, _ = build_client()
+    response = client.post("/v1/chat/completions", json={
         "provider": "openai",
         "model": "not-an-enabled-model",
         "messages": [{"role": "user", "content": "hello"}],
@@ -53,9 +78,13 @@ def test_unknown_model_is_rejected_before_calling_a_vendor(monkeypatch):
     assert "not enabled" in response.json()["detail"]
 
 
-def test_unconfigured_gemini_provider_is_rejected(monkeypatch):
-    monkeypatch.setattr(settings, "gemini_api_key", None)
-    response = TestClient(app).post("/v1/chat/completions", json={
+def test_unconfigured_gemini_provider_is_rejected():
+    client, _ = build_client(settings=Settings(
+        _env_file=None,
+        openai_api_key="test-openai-key",
+        gemini_api_key=None,
+    ))
+    response = client.post("/v1/chat/completions", json={
         "provider": "gemini",
         "messages": [{"role": "user", "content": "hello"}],
     })
@@ -63,7 +92,7 @@ def test_unconfigured_gemini_provider_is_rejected(monkeypatch):
     assert response.json()["detail"] == "GEMINI_API_KEY is not configured on the server."
 
 
-def test_selected_provider_and_model_are_used(monkeypatch):
+def test_selected_provider_and_model_are_used():
     seen: dict = {}
 
     class FakeCompletions:
@@ -73,21 +102,12 @@ def test_selected_provider_and_model_are_used(monkeypatch):
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
-
-    @asynccontextmanager
-    async def fake_connected_tools():
-        yield SimpleNamespace(tools=[])
-
-    monkeypatch.setattr(settings, "gemini_api_key", "test-key")
-    monkeypatch.setattr(main, "provider_client", lambda provider: fake_client)
-    monkeypatch.setattr(main, "connected_tools", fake_connected_tools)
-
-    response = TestClient(app).post("/v1/chat/completions", json={
+    client, _ = build_client(provider_client=fake_client)
+    response = client.post("/v1/chat/completions", json={
         "provider": "gemini",
         "model": "gemini-3.8-flash",
         "messages": [{"role": "user", "content": "hello"}],
     })
-
     assert response.status_code == 200
     assert response.json()["provider"] == "gemini"
     assert response.json()["model"] == "gemini-3.8-flash"
@@ -96,7 +116,7 @@ def test_selected_provider_and_model_are_used(monkeypatch):
     assert seen["messages"][-1] == {"role": "user", "content": "hello"}
 
 
-def test_streaming_completion_emits_sse_deltas(monkeypatch):
+def test_streaming_completion_emits_sse_deltas():
     seen: dict = {}
 
     async def chunks():
@@ -108,23 +128,14 @@ def test_streaming_completion_emits_sse_deltas(monkeypatch):
             seen.update(kwargs)
             return chunks()
 
-    @asynccontextmanager
-    async def fake_connected_tools():
-        yield SimpleNamespace(tools=[])
-
-    monkeypatch.setattr(settings, "gemini_api_key", "test-key")
-    monkeypatch.setattr(main, "provider_client", lambda provider: SimpleNamespace(
-        chat=SimpleNamespace(completions=FakeCompletions()),
-    ))
-    monkeypatch.setattr(main, "connected_tools", fake_connected_tools)
-
-    response = TestClient(app).post("/v1/chat/completions", json={
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client, _ = build_client(provider_client=fake_client)
+    response = client.post("/v1/chat/completions", json={
         "provider": "gemini",
         "model": "gemini-3.8-flash",
         "stream": True,
         "messages": [{"role": "user", "content": "hello"}],
     })
-
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'event: delta\ndata: {"content": "Hello "}' in response.text
@@ -133,7 +144,7 @@ def test_streaming_completion_emits_sse_deltas(monkeypatch):
     assert seen["stream"] is True
 
 
-def test_streaming_completion_runs_mcp_tool_round(monkeypatch):
+def test_streaming_completion_runs_mcp_tool_round():
     requests: list[dict] = []
     tool_requests: list[tuple[str, dict]] = []
 
@@ -176,22 +187,17 @@ def test_streaming_completion_runs_mcp_tool_round(monkeypatch):
             return {"temperature": 72}
 
     @asynccontextmanager
-    async def fake_connected_tools():
+    async def fake_tools():
         yield FakeTools()
 
-    monkeypatch.setattr(settings, "gemini_api_key", "test-key")
-    monkeypatch.setattr(main, "provider_client", lambda provider: SimpleNamespace(
-        chat=SimpleNamespace(completions=FakeCompletions()),
-    ))
-    monkeypatch.setattr(main, "connected_tools", fake_connected_tools)
-
-    response = TestClient(app).post("/v1/chat/completions", json={
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client, _ = build_client(provider_client=fake_client, tool_gateway_factory=fake_tools)
+    response = client.post("/v1/chat/completions", json={
         "provider": "gemini",
         "model": "gemini-3.8-flash",
         "stream": True,
         "messages": [{"role": "user", "content": "weather?"}],
     })
-
     assert response.status_code == 200
     assert "event: tool_call" in response.text
     assert '"name": "weather_lookup"' in response.text
