@@ -8,6 +8,7 @@ from fastmcp.client.client import CallToolResult
 from app.chat_service import ChatCompletionService
 from app.config import Settings
 from app.main import create_app
+from app.openai_compat import OpenAICompatibilityAdapter
 from app.providers import ProviderRegistry
 from app.serialization import JsonValueSerializer
 
@@ -32,7 +33,11 @@ def build_client(
     if provider_client is not None:
         providers.client_for = lambda _provider: provider_client
     chat_service = ChatCompletionService(providers, tool_gateway_factory)
-    container = SimpleNamespace(providers=providers, chat_service=chat_service)
+    container = SimpleNamespace(
+        providers=providers,
+        chat_service=chat_service,
+        openai_compat=OpenAICompatibilityAdapter(providers, chat_service),
+    )
     return TestClient(create_app(container)), providers
 
 
@@ -53,6 +58,25 @@ def test_model_catalog_contains_both_providers_without_secrets():
     assert response.status_code == 200
     assert [provider["id"] for provider in response.json()["providers"]] == ["openai", "gemini"]
     assert "api_key" not in response.text.lower()
+
+
+def test_librechat_model_catalog_uses_openai_shape():
+    client, _ = build_client()
+    response = client.get("/v1/compat/gemini/models")
+    assert response.status_code == 200
+    assert response.json()["object"] == "list"
+    assert response.json()["data"][0] == {
+        "id": "gemini-3.8-flash",
+        "object": "model",
+        "created": 0,
+        "owned_by": "gemini",
+    }
+
+
+def test_unknown_librechat_provider_is_rejected():
+    client, _ = build_client()
+    response = client.get("/v1/compat/unknown/models")
+    assert response.status_code == 422
 
 
 def test_fastmcp_tool_result_is_reduced_to_json_safe_data():
@@ -114,6 +138,56 @@ def test_selected_provider_and_model_are_used():
     assert response.json()["answer"] == "Hello from Gemini"
     assert seen["model"] == "gemini-3.8-flash"
     assert seen["messages"][-1] == {"role": "user", "content": "hello"}
+
+
+def test_librechat_non_streaming_request_uses_selected_vendor():
+    seen: dict = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            seen.update(kwargs)
+            message = SimpleNamespace(tool_calls=None, content="LibreChat response")
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client, _ = build_client(provider_client=fake_client)
+    response = client.post("/v1/compat/openai/chat/completions", json={
+        "model": "gpt-6-luna",
+        "messages": [
+            {"role": "developer", "content": "Be concise."},
+            {"role": "user", "content": "hello"},
+        ],
+    })
+    assert response.status_code == 200
+    assert response.json()["object"] == "chat.completion"
+    assert response.json()["choices"][0]["message"]["content"] == "LibreChat response"
+    assert seen["model"] == "gpt-6-luna"
+    assert seen["messages"][-2] == {"role": "system", "content": "Be concise."}
+
+
+def test_librechat_streaming_request_uses_openai_sse_shape():
+    async def chunks():
+        yield SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content="Hello from LibreChat", tool_calls=None),
+        )])
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return chunks()
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client, _ = build_client(provider_client=fake_client)
+    response = client.post("/v1/compat/gemini/chat/completions", json={
+        "model": "gemini-3.8-flash",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"object": "chat.completion.chunk"' in response.text
+    assert '"content": "Hello from LibreChat"' in response.text
+    assert '"finish_reason": "stop"' in response.text
+    assert response.text.endswith("data: [DONE]\n\n")
 
 
 def test_streaming_completion_emits_sse_deltas():

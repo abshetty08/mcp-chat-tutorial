@@ -1,0 +1,50 @@
+version: 1.3.17
+cache: true
+
+interface:
+  endpointsMenu: true
+  modelSelect: true
+  presets: true
+  parameters: false
+
+endpoints:
+  custom:
+    - name: ChatGPT
+      apiKey: local-mcp-gateway
+      baseURL: http://chat-api:8000/v1/compat/openai
+      models:
+        default:
+          - gpt-6-luna
+          - gpt-6.1-sol
+          - gpt-6-astra
+        fetch: true
+      titleConvo: false
+      summarize: false
+      modelDisplayLabel: ChatGPT + MCP
+      dropParams:
+        - frequency_penalty
+        - presence_penalty
+        - stop
+        - temperature
+        - top_p
+        - user
+
+    - name: Gemini
+      apiKey: local-mcp-gateway
+      baseURL: http://chat-api:8000/v1/compat/gemini
+      models:
+        default:
+          - gemini-3.8-flash
+          - gemini-3.5-flash-lite
+          - gemini-3.1-pro-preview
+        fetch: true
+      titleConvo: false
+      summarize: false
+      modelDisplayLabel: Gemini + MCP
+      dropParams:
+        - frequency_penalty
+        - presence_penalty
+        - stop
+        - temperature
+        - top_p
+        - user

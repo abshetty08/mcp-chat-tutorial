@@ -8,7 +8,7 @@ ProviderId = Literal["openai", "gemini"]
 
 
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
+    role: Literal["system", "user", "assistant"]
     content: str = Field(min_length=1, max_length=12_000)
 
 
