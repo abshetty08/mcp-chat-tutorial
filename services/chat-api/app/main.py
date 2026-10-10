@@ -2,11 +2,13 @@
 import json
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastmcp import Client as MCPClient
 from openai import APIError, AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -36,6 +38,7 @@ class ChatRequest(BaseModel):
     messages: list[Message] = Field(min_length=1, max_length=40)
     provider: ProviderId = "openai"
     model: str | None = Field(default=None, max_length=100)
+    stream: bool = False
 
 
 class ToolCall(BaseModel):
@@ -183,6 +186,134 @@ URLs in Markdown. Clearly say that stock data may be delayed and do not provide
 personalized financial advice. Answer normal, timeless questions directly."""
 
 
+def conversation_messages(request: ChatRequest) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+        *[{"role": message.role, "content": message.content} for message in request.messages],
+    ]
+
+
+def completion_options(
+    request: ChatRequest,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    stream: bool = False,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+    }
+    if stream:
+        options["stream"] = True
+    # GPT-6 Luna Chat Completions supports function tools with reasoning disabled.
+    if request.provider == "openai" and model == "gpt-6-luna":
+        options["reasoning_effort"] = "none"
+    return options
+
+
+def sse_event(event: str, payload: Any) -> str:
+    """Encode one Server-Sent Event without allowing raw newlines into its frame."""
+    return f"event: {event}\ndata: {json.dumps(jsonable_encoder(payload))}\n\n"
+
+
+def merge_tool_call_delta(pending: dict[int, dict[str, Any]], delta_call: Any) -> None:
+    """Join the incremental tool-call fields emitted by Chat Completions."""
+    index = delta_call.index
+    entry = pending.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+    if delta_call.id:
+        entry["id"] = delta_call.id
+    function = delta_call.function
+    if function and function.name:
+        entry["function"]["name"] += function.name
+    if function and function.arguments:
+        entry["function"]["arguments"] += function.arguments
+    # Gemini thinking models attach an opaque thought signature to a streamed
+    # function call. It must be returned unchanged with that call on the next
+    # completion request, but it is never exposed in our client-facing events.
+    extra_content = getattr(delta_call, "extra_content", None)
+    if extra_content:
+        entry["extra_content"] = dump_value(extra_content)
+
+
+async def stream_chat_events(
+    request: ChatRequest,
+    model: str,
+    client: AsyncOpenAI,
+) -> AsyncIterator[str]:
+    """Stream model text and completed MCP calls as Server-Sent Events."""
+    messages = conversation_messages(request)
+    calls_made: list[ToolCall] = []
+    emitted_text = False
+    try:
+        async with connected_tools() as mcp:
+            for round_index in range(4):
+                stream = await client.chat.completions.create(
+                    **completion_options(request, model, messages, mcp.tools, stream=True),
+                )
+                pending_calls: dict[int, dict[str, Any]] = {}
+                round_content = ""
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        round_content += delta.content
+                        emitted_text = True
+                        yield sse_event("delta", {"content": delta.content})
+                    for delta_call in delta.tool_calls or []:
+                        merge_tool_call_delta(pending_calls, delta_call)
+
+                if not pending_calls:
+                    if not emitted_text:
+                        fallback = "I could not produce a text response. Please try again."
+                        yield sse_event("delta", {"content": fallback})
+                    yield sse_event("done", {
+                        "provider": request.provider,
+                        "model": model,
+                        "tool_calls": calls_made,
+                    })
+                    return
+
+                assistant_calls = []
+                for index, call in sorted(pending_calls.items()):
+                    call["id"] = call["id"] or f"call_{round_index}_{index}"
+                    assistant_calls.append(call)
+                messages.append({
+                    "role": "assistant",
+                    "content": round_content or None,
+                    "tool_calls": assistant_calls,
+                })
+                for call in assistant_calls:
+                    arguments = json.loads(call["function"]["arguments"] or "{}")
+                    result = await mcp.call(call["function"]["name"], arguments)
+                    completed_call = ToolCall(
+                        name=call["function"]["name"],
+                        arguments=arguments,
+                        result=result,
+                    )
+                    calls_made.append(completed_call)
+                    yield sse_event("tool_call", completed_call)
+                    messages.append({
+                        "role": "tool",
+                        "name": call["function"]["name"],
+                        "tool_call_id": call["id"],
+                        "content": json.dumps(result),
+                    })
+    except APIError as exc:
+        vendor = "OpenAI" if request.provider == "openai" else "Gemini"
+        yield sse_event("error", {"detail": f"{vendor} request failed: {exc.message}"})
+        return
+    except Exception as exc:
+        yield sse_event("error", {"detail": f"Tool service request failed: {exc}"})
+        return
+
+    yield sse_event("error", {"detail": "The model exceeded the maximum number of tool-call rounds."})
+
+
 app = FastAPI(title="Multi-provider MCP Chat API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -204,29 +335,29 @@ async def models() -> ModelsResponse:
     return model_catalog()
 
 
-@app.post("/v1/chat/completions", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+@app.post("/v1/chat/completions", response_model=None)
+async def chat(request: ChatRequest) -> ChatResponse | StreamingResponse:
     model = resolve_model(request.provider, request.model)
     client = provider_client(request.provider)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-        *[{"role": message.role, "content": message.content} for message in request.messages],
-    ]
+    if request.stream:
+        return StreamingResponse(
+            stream_chat_events(request, model, client),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    messages = conversation_messages(request)
     calls_made: list[ToolCall] = []
     answer = ""
     try:
         async with connected_tools() as mcp:
             for _ in range(4):
-                request_options: dict[str, Any] = {
-                    "model": model,
-                    "messages": messages,
-                    "tools": mcp.tools,
-                    "tool_choice": "auto",
-                }
-                # GPT-6 Luna Chat Completions supports function tools with reasoning disabled.
-                if request.provider == "openai" and model == "gpt-6-luna":
-                    request_options["reasoning_effort"] = "none"
-                completion = await client.chat.completions.create(**request_options)
+                completion = await client.chat.completions.create(
+                    **completion_options(request, model, messages, mcp.tools),
+                )
                 response_message = completion.choices[0].message
                 if not response_message.tool_calls:
                     answer = (response_message.content or "").strip()
