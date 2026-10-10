@@ -64,6 +64,11 @@ class ProviderRegistry:
             default_provider="gemini" if providers[1].configured and not providers[0].configured else "openai",
         )
 
+    def models_for(self, provider_id: ProviderId) -> tuple[str, ...]:
+        """Return the server-controlled model allowlist for one provider."""
+
+        return self._providers[provider_id].models
+
     def resolve_model(self, provider_id: ProviderId, requested_model: str | None) -> str:
         provider = self._providers[provider_id]
         if not provider.models:

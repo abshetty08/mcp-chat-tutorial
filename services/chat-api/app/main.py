@@ -7,7 +7,8 @@ from .chat_service import ChatCompletionService
 from .config import Settings
 from .errors import ChatServiceError
 from .mcp_gateway import MCPToolGateway
-from .models import ChatRequest, ChatResponse, ModelsResponse
+from .models import ChatRequest, ChatResponse, ModelsResponse, ProviderId
+from .openai_compat import CompatibleChatRequest, OpenAICompatibilityAdapter
 from .providers import ProviderRegistry
 
 
@@ -21,6 +22,7 @@ class ApplicationContainer:
             self.providers,
             lambda: MCPToolGateway(settings.mcp_urls),
         )
+        self.openai_compat = OpenAICompatibilityAdapter(self.providers, self.chat_service)
 
 
 def create_app(container: ApplicationContainer) -> FastAPI:
@@ -54,6 +56,20 @@ def create_app(container: ApplicationContainer) -> FastAPI:
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
         return await container.chat_service.complete(request)
+
+    @app.get("/v1/compat/{provider}/models")
+    async def compatible_models(provider: ProviderId) -> dict:
+        return container.openai_compat.models(provider)
+
+    @app.post("/v1/compat/{provider}/chat/completions", response_model=None)
+    async def compatible_chat(provider: ProviderId, request: CompatibleChatRequest):
+        if request.stream:
+            return StreamingResponse(
+                container.openai_compat.stream(provider, request),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        return await container.openai_compat.complete(provider, request)
 
     return app
 

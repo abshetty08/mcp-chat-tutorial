@@ -37,6 +37,14 @@ class CompletionContext:
     client: AsyncOpenAI
 
 
+@dataclass(frozen=True)
+class ChatStreamEvent:
+    """Provider-neutral event emitted by a streaming completion."""
+
+    name: str
+    payload: Any
+
+
 class ChatCompletionService:
     """Run bounded completion/tool loops for any registered model provider."""
 
@@ -88,10 +96,21 @@ class ChatCompletionService:
         )
 
     def stream(self, request: ChatRequest) -> AsyncIterator[str]:
+        events = self.events(request)
+        return self._encode_events(events)
+
+    def events(self, request: ChatRequest) -> AsyncIterator[ChatStreamEvent]:
+        """Expose structured events for HTTP protocol adapters."""
+
         context = self.prepare(request)
         return self._stream_events(context)
 
-    async def _stream_events(self, context: CompletionContext) -> AsyncIterator[str]:
+    @staticmethod
+    async def _encode_events(events: AsyncIterator[ChatStreamEvent]) -> AsyncIterator[str]:
+        async for event in events:
+            yield ServerSentEventEncoder.encode(event.name, event.payload)
+
+    async def _stream_events(self, context: CompletionContext) -> AsyncIterator[ChatStreamEvent]:
         messages = self._conversation_messages(context.request)
         calls_made: list[ToolCall] = []
         emitted_text = False
@@ -110,14 +129,14 @@ class ChatCompletionService:
                         if delta.content:
                             round_content += delta.content
                             emitted_text = True
-                            yield ServerSentEventEncoder.encode("delta", {"content": delta.content})
+                            yield ChatStreamEvent("delta", {"content": delta.content})
                         for delta_call in delta.tool_calls or []:
                             accumulator.add(delta_call)
 
                     if not accumulator.has_calls:
                         if not emitted_text:
-                            yield ServerSentEventEncoder.encode("delta", {"content": self.EMPTY_RESPONSE})
-                        yield ServerSentEventEncoder.encode("done", {
+                            yield ChatStreamEvent("delta", {"content": self.EMPTY_RESPONSE})
+                        yield ChatStreamEvent("done", {
                             "provider": context.request.provider,
                             "model": context.model,
                             "tool_calls": calls_made,
@@ -134,15 +153,15 @@ class ChatCompletionService:
                         arguments = json.loads(call["function"]["arguments"] or "{}")
                         completed_call = await self._execute_tool_call(call, arguments, tools, messages)
                         calls_made.append(completed_call)
-                        yield ServerSentEventEncoder.encode("tool_call", completed_call)
+                        yield ChatStreamEvent("tool_call", completed_call)
         except APIError as exc:
-            yield ServerSentEventEncoder.encode("error", {"detail": self._provider_error(context, exc).detail})
+            yield ChatStreamEvent("error", {"detail": self._provider_error(context, exc).detail})
             return
         except Exception as exc:
-            yield ServerSentEventEncoder.encode("error", {"detail": f"Tool service request failed: {exc}"})
+            yield ChatStreamEvent("error", {"detail": f"Tool service request failed: {exc}"})
             return
 
-        yield ServerSentEventEncoder.encode(
+        yield ChatStreamEvent(
             "error",
             {"detail": "The model exceeded the maximum number of tool-call rounds."},
         )

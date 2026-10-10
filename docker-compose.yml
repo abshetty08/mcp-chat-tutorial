@@ -27,10 +27,45 @@ services:
       PORT: "8002"
     ports:
       - "8002:8002"
-  web:
-    build: ./apps/web
+  librechat:
+    image: ghcr.io/librechat-ai/librechat:v0.8.8
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3080"
+      MONGO_URI: mongodb://mongodb:27017/LibreChat
+      DOMAIN_CLIENT: http://localhost:3000
+      DOMAIN_SERVER: http://localhost:3000
+      APP_TITLE: MCP Chat Tutorial
+      ALLOW_EMAIL_LOGIN: "true"
+      ALLOW_REGISTRATION: ${LIBRECHAT_ALLOW_REGISTRATION:-true}
+      ALLOW_SOCIAL_LOGIN: "false"
+      NO_INDEX: "true"
+      SCHEDULES_SINGLE_PROCESS: "true"
+      LIBRECHAT_TEMP_CREDENTIALS_PATH: /app/data/.env.temp
     ports:
-      - "3000:80"
+      - "3000:3080"
     depends_on:
       chat-api:
         condition: service_started
+      mongodb:
+        condition: service_started
+    volumes:
+      - ./librechat.yaml:/app/librechat.yaml:ro
+      - librechat-data:/app/data
+      - librechat-images:/app/client/public/images
+      - librechat-uploads:/app/uploads
+      - librechat-logs:/app/logs
+    restart: unless-stopped
+  mongodb:
+    image: mongo:4.4.18
+    command: mongod --noauth
+    volumes:
+      - librechat-mongodb:/data/db
+    restart: unless-stopped
+
+volumes:
+  librechat-data:
+  librechat-images:
+  librechat-uploads:
+  librechat-logs:
+  librechat-mongodb:
