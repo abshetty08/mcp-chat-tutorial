@@ -21,6 +21,21 @@ The folders in `services/` are standalone Python microservices, each with its ow
 Dockerfile and requirements. The official LibreChat image supplies the web client,
 authentication, and conversation persistence; MongoDB stores its application data.
 
+## Client application
+
+LibreChat provides the authentication and account experience for the tutorial
+deployment. Create the first local account after starting the Docker stack; there
+are no default credentials.
+
+![LibreChat sign-in screen for the MCP Chat Tutorial](docs/images/librechat-login.jpg)
+
+Once signed in, use the model selector at the top of a new conversation to switch
+between the **ChatGPT + MCP** and **Gemini + MCP** endpoints and their configured
+models. Both endpoints stream through the same Python gateway and can use the MCP
+search, weather, sports, and stock tools.
+
+![LibreChat chat screen showing the ChatGPT and Gemini endpoint selector](docs/images/librechat-chat.jpg)
+
 ## Code organization
 
 The tutorial uses small objects with explicit responsibilities and keeps framework
